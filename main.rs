@@ -4,6 +4,12 @@ use std::io::{Read, Write, Cursor};
 use image::{ImageBuffer, Rgba, DynamicImage, ImageFormat};
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "-V" || a == "--version") {
+        println!("shotdraw {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
     let geometry = run_slurp();
     let png_bytes = run_grim(&geometry);
     let screenshot = image::load_from_memory(&png_bytes).unwrap();
@@ -18,6 +24,11 @@ fn main() {
         drawing: false,
         done: false,
     };
+
+    Command::new("swaymsg")
+        .arg("for_window [title=\"Screenshot Annotator\"] floating enable, fullscreen enable")
+        .output()
+        .expect("Failed to run swaymsg");
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([width, height]),
