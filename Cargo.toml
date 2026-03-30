@@ -1,9 +1,10 @@
 [package]
 name = "shotdraw"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 
 [dependencies]
+ab_glyph = "0.2"
 eframe = "0.33.3"
 image = "0.25.10"
 

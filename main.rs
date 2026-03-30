@@ -12,6 +12,7 @@ enum Tool {
     Rectangle,
     Circle,
     Arrow,
+    Text,
 }
 
 #[derive(Clone)]
@@ -21,6 +22,36 @@ struct DrawnShape {
     end: Pos2,
     color: Color32,
     thickness: f32,
+    text: String,
+    font_size: f32,
+}
+
+fn load_system_font() -> Vec<u8> {
+    if let Ok(output) = Command::new("fc-match")
+        .args(["--format=%{file}", "sans:regular"])
+        .output()
+    {
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path.is_empty() {
+                if let Ok(data) = std::fs::read(&path) {
+                    return data;
+                }
+            }
+        }
+    }
+    for path in &[
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+    ] {
+        if let Ok(data) = std::fs::read(path) {
+            return data;
+        }
+    }
+    panic!("Could not find a system font — install fonts-dejavu or similar");
 }
 
 fn main() {
@@ -63,6 +94,20 @@ fn main() {
                 ),
                 Default::default(),
             );
+
+            let font_bytes = load_system_font();
+
+            let mut fonts = egui::FontDefinitions::default();
+            fonts.font_data.insert(
+                "system".to_owned(),
+                egui::FontData::from_owned(font_bytes.clone()).into(),
+            );
+            fonts.families
+                .get_mut(&egui::FontFamily::Proportional)
+                .unwrap()
+                .insert(0, "system".to_owned());
+            cc.egui_ctx.set_fonts(fonts);
+
             Ok(Box::new(ScreenshotApp {
                 screenshot: rgba,
                 texture,
@@ -74,6 +119,10 @@ fn main() {
                 tool: Tool::Rectangle,
                 color: Color32::RED,
                 thickness: 2.0,
+                font_bytes,
+                text_anchor: None,
+                text_buffer: String::new(),
+                font_size: 24.0,
             }))
         }),
     )
@@ -93,17 +142,50 @@ struct ScreenshotApp {
     tool: Tool,
     color: Color32,
     thickness: f32,
+    font_bytes: Vec<u8>,
+    text_anchor: Option<Pos2>,
+    text_buffer: String,
+    font_size: f32,
+}
+
+impl ScreenshotApp {
+    fn commit_text(&mut self) {
+        if let Some(anchor) = self.text_anchor.take() {
+            if !self.text_buffer.is_empty() {
+                self.shapes.push(DrawnShape {
+                    tool: Tool::Text,
+                    start: anchor,
+                    end: anchor,
+                    color: self.color,
+                    thickness: 0.0,
+                    text: std::mem::take(&mut self.text_buffer),
+                    font_size: self.font_size,
+                });
+            } else {
+                self.text_buffer.clear();
+            }
+        }
+    }
 }
 
 impl eframe::App for ScreenshotApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            if self.text_anchor.is_some() {
+                self.text_anchor = None;
+                self.text_buffer.clear();
+            } else {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
             return;
         }
 
         if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
-            self.done = true;
+            if self.text_anchor.is_some() {
+                self.commit_text();
+            } else {
+                self.done = true;
+            }
         }
 
         if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Z)) {
@@ -116,6 +198,18 @@ impl eframe::App for ScreenshotApp {
                 ui.selectable_value(&mut self.tool, Tool::Rectangle, "⬜ Rect");
                 ui.selectable_value(&mut self.tool, Tool::Circle, "⭕ Circle");
                 ui.selectable_value(&mut self.tool, Tool::Arrow, "➡ Arrow");
+                ui.selectable_value(&mut self.tool, Tool::Text, "✏ Text");
+
+                if self.tool == Tool::Text {
+                    ui.separator();
+                    ui.label("Font:");
+                    ui.add(
+                        egui::DragValue::new(&mut self.font_size)
+                            .range(8.0..=96.0)
+                            .speed(0.5)
+                            .suffix("pt"),
+                    );
+                }
 
                 ui.separator();
 
@@ -140,7 +234,6 @@ impl eframe::App for ScreenshotApp {
                     let painter = ui.painter();
                     painter.rect_filled(rect, egui::CornerRadius::same(3), swatch_color);
                     if selected {
-                        // Use dark outline for light colors, light outline for dark ones
                         let luma = swatch_color.r() as f32 * 0.299
                             + swatch_color.g() as f32 * 0.587
                             + swatch_color.b() as f32 * 0.114;
@@ -174,32 +267,59 @@ impl eframe::App for ScreenshotApp {
 
             let (primary_down, interact_pos) = ctx.input(|i| (i.pointer.primary_down(), i.pointer.interact_pos()));
 
-            if primary_down {
-                if let Some(pos) = interact_pos {
-                    if ui.rect_contains_pointer(ui.min_rect()) || self.drawing {
-                        if !self.drawing {
-                            self.drag_start = Some(pos);
-                            self.drawing = true;
+            if self.tool == Tool::Text {
+                let clicked = ctx.input(|i| i.pointer.primary_clicked());
+                if clicked {
+                    if let Some(pos) = interact_pos {
+                        if ui.rect_contains_pointer(ui.min_rect()) {
+                            self.commit_text();
+                            self.text_anchor = Some(pos);
                         }
-                        self.drag_end = Some(pos);
                     }
                 }
-            } else if self.drawing {
-                if let (Some(start), Some(end)) = (self.drag_start, self.drag_end) {
-                    // Discard zero-area / single-click non-drags
-                    if (end - start).length() >= MIN_DRAG_PX {
-                        self.shapes.push(DrawnShape {
-                            tool: self.tool,
-                            start,
-                            end,
-                            color: self.color,
-                            thickness: self.thickness,
-                        });
-                    }
+
+                if self.text_anchor.is_some() {
+                    ctx.input(|i| {
+                        for event in &i.events {
+                            match event {
+                                egui::Event::Text(t) => self.text_buffer.push_str(t),
+                                egui::Event::Key { key: egui::Key::Backspace, pressed: true, .. } => {
+                                    self.text_buffer.pop();
+                                }
+                                _ => {}
+                            }
+                        }
+                    });
                 }
-                self.drag_start = None;
-                self.drag_end = None;
-                self.drawing = false;
+            } else {
+                if primary_down {
+                    if let Some(pos) = interact_pos {
+                        if ui.rect_contains_pointer(ui.min_rect()) || self.drawing {
+                            if !self.drawing {
+                                self.drag_start = Some(pos);
+                                self.drawing = true;
+                            }
+                            self.drag_end = Some(pos);
+                        }
+                    }
+                } else if self.drawing {
+                    if let (Some(start), Some(end)) = (self.drag_start, self.drag_end) {
+                        if (end - start).length() >= MIN_DRAG_PX {
+                            self.shapes.push(DrawnShape {
+                                tool: self.tool,
+                                start,
+                                end,
+                                color: self.color,
+                                thickness: self.thickness,
+                                text: String::new(),
+                                font_size: 0.0,
+                            });
+                        }
+                    }
+                    self.drag_start = None;
+                    self.drag_end = None;
+                    self.drawing = false;
+                }
             }
 
             let painter = ui.painter();
@@ -213,13 +333,34 @@ impl eframe::App for ScreenshotApp {
                     end,
                     color: self.color,
                     thickness: self.thickness,
+                    text: String::new(),
+                    font_size: 0.0,
                 });
+            }
+
+            if self.tool == Tool::Text {
+                if let Some(anchor) = self.text_anchor {
+                    let blink_on = (ctx.input(|i| i.time) * 2.0) as i64 % 2 == 0;
+                    let display = if blink_on {
+                        format!("{}|", self.text_buffer)
+                    } else {
+                        self.text_buffer.clone()
+                    };
+                    painter.text(
+                        anchor,
+                        egui::Align2::LEFT_TOP,
+                        &display,
+                        egui::FontId::proportional(self.font_size),
+                        self.color,
+                    );
+                }
+                ctx.request_repaint();
             }
         });
 
         if self.done {
             self.done = false;
-            let annotated = render_to_image(&self.screenshot, &self.shapes);
+            let annotated = render_to_image(&self.screenshot, &self.shapes, &self.font_bytes);
             copy_to_clipboard(&annotated);
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -259,6 +400,17 @@ fn paint_shape(painter: &egui::Painter, shape: &DrawnShape) {
                 painter.arrow(shape.start, vec, stroke);
             }
         }
+        Tool::Text => {
+            if !shape.text.is_empty() {
+                painter.text(
+                    shape.start,
+                    egui::Align2::LEFT_TOP,
+                    &shape.text,
+                    egui::FontId::proportional(shape.font_size),
+                    shape.color,
+                );
+            }
+        }
     }
 }
 
@@ -269,7 +421,6 @@ fn paint_shape(painter: &egui::Painter, shape: &DrawnShape) {
 fn run_slurp() -> String {
     let output = Command::new("slurp").output().expect("Failed to run slurp");
     if !output.status.success() {
-        // User cancelled selection — exit cleanly, no panic
         std::process::exit(0);
     }
     String::from_utf8_lossy(&output.stdout).trim().to_string()
@@ -293,9 +444,54 @@ fn run_grim(geometry: &str) -> Vec<u8> {
     buffer
 }
 
+fn render_text(
+    img: &mut ImageBuffer<Rgba<u8>, Vec<u8>>,
+    text: &str,
+    x: f32,
+    y: f32,
+    size: f32,
+    color: Rgba<u8>,
+    font: &ab_glyph::FontVec,
+) {
+    use ab_glyph::{Font, PxScale, ScaleFont};
+
+    let scale = PxScale::from(size);
+    let scaled = font.as_scaled(scale);
+    let mut cursor_x = x;
+    let baseline_y = y + scaled.ascent();
+
+    for ch in text.chars() {
+        let gid = scaled.glyph_id(ch);
+        let glyph = gid.with_scale_and_position(scale, ab_glyph::point(cursor_x, baseline_y));
+        cursor_x += scaled.h_advance(gid);
+
+        if let Some(og) = font.outline_glyph(glyph) {
+            let bounds = og.px_bounds();
+            let w = img.width() as i64;
+            let h = img.height() as i64;
+            og.draw(|gx, gy, cov| {
+                if cov < 0.05 { return; }
+                let px_x = bounds.min.x as i64 + gx as i64;
+                let px_y = bounds.min.y as i64 + gy as i64;
+                if px_x < 0 || px_x >= w || px_y < 0 || px_y >= h { return; }
+                let base = img.get_pixel(px_x as u32, px_y as u32);
+                let a = cov;
+                let out = Rgba([
+                    (color[0] as f32 * a + base[0] as f32 * (1.0 - a)) as u8,
+                    (color[1] as f32 * a + base[1] as f32 * (1.0 - a)) as u8,
+                    (color[2] as f32 * a + base[2] as f32 * (1.0 - a)) as u8,
+                    255,
+                ]);
+                img.put_pixel(px_x as u32, px_y as u32, out);
+            });
+        }
+    }
+}
+
 fn render_to_image(
     base: &ImageBuffer<Rgba<u8>, Vec<u8>>,
     shapes: &[DrawnShape],
+    font_bytes: &[u8],
 ) -> ImageBuffer<Rgba<u8>, Vec<u8>> {
     let mut img = base.clone();
 
@@ -340,6 +536,14 @@ fn render_to_image(
             }
             Tool::Arrow => {
                 render_arrow(&mut img, shape.start, shape.end, px, t);
+            }
+            Tool::Text => {
+                if !shape.text.is_empty() {
+                    let font = ab_glyph::FontVec::try_from_vec(font_bytes.to_vec())
+                        .expect("Invalid font data");
+                    render_text(&mut img, &shape.text, shape.start.x, shape.start.y,
+                                shape.font_size, px, &font);
+                }
             }
         }
     }
@@ -454,7 +658,6 @@ fn render_ellipse(
 ) {
     let w = img.width() as i64;
     let h = img.height() as i64;
-    // Steps based on circumference of the larger axis — no erroneous ×2
     let steps = ((rx.max(ry) * 2.0 * std::f32::consts::PI) as usize).max(1440);
     let half_t = (thickness as f32 - 1.0) / 2.0;
 
@@ -489,8 +692,6 @@ fn copy_to_clipboard(img: &ImageBuffer<Rgba<u8>, Vec<u8>>) {
         .spawn()
         .expect("Failed to spawn wl-copy — is it installed?");
 
-    // Write on a separate thread to avoid deadlock if the pipe buffer fills
-    // (can happen with large HiDPI screenshots).
     let mut stdin = child.stdin.take().expect("wl-copy stdin not captured");
     let writer = std::thread::spawn(move || {
         stdin.write_all(&buf).ok();
