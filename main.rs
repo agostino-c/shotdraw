@@ -6,6 +6,7 @@ use image::{ImageBuffer, Rgba, DynamicImage, ImageFormat};
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Tool {
     Rectangle,
+    Circle,
 }
 
 fn main() {
@@ -88,6 +89,7 @@ impl eframe::App for ScreenshotApp {
                 // Tool selector
                 ui.label("Tool:");
                 ui.selectable_value(&mut self.tool, Tool::Rectangle, "⬜ Rect");
+                ui.selectable_value(&mut self.tool, Tool::Circle, "⭕ Circle");
 
                 ui.separator();
 
@@ -164,14 +166,34 @@ impl eframe::App for ScreenshotApp {
                 self.drawing = false;
             }
 
-            // Draw rectangle
             if let (Some(start), Some(end)) = (self.start_pos, self.end_pos) {
-                ui.painter().rect_stroke(
-                    Rect::from_two_pos(start, end),
-                    egui::CornerRadius::ZERO,
-                    Stroke::new(self.thickness, self.color),
-                    egui::StrokeKind::Middle,
-                );
+                let stroke = Stroke::new(self.thickness, self.color);
+                match self.tool {
+                    Tool::Rectangle => {
+                        ui.painter().rect_stroke(
+                            Rect::from_two_pos(start, end),
+                            egui::CornerRadius::ZERO,
+                            stroke,
+                            egui::StrokeKind::Middle,
+                        );
+                    }
+                    Tool::Circle => {
+                        let center = egui::pos2(
+                            (start.x + end.x) / 2.0,
+                            (start.y + end.y) / 2.0,
+                        );
+                        let radii = egui::vec2(
+                            (end.x - start.x).abs() / 2.0,
+                            (end.y - start.y).abs() / 2.0,
+                        );
+                        ui.painter().add(egui::Shape::Ellipse(egui::epaint::EllipseShape {
+                            center,
+                            radius: radii,
+                            fill: Color32::TRANSPARENT,
+                            stroke,
+                        }));
+                    }
+                }
             }
         });
 
@@ -181,6 +203,7 @@ impl eframe::App for ScreenshotApp {
                 &self.screenshot,
                 self.start_pos,
                 self.end_pos,
+                self.tool,
                 self.color,
                 self.thickness,
             );
@@ -220,6 +243,7 @@ fn render_to_image(
     base: &ImageBuffer<Rgba<u8>, Vec<u8>>,
     start: Option<Pos2>,
     end: Option<Pos2>,
+    tool: Tool,
     color: Color32,
     thickness: f32,
 ) -> ImageBuffer<Rgba<u8>, Vec<u8>> {
@@ -228,32 +252,70 @@ fn render_to_image(
     let t = (thickness.round() as u32).max(1);
 
     if let (Some(s), Some(e)) = (start, end) {
-        let (x0, y0) = (s.x as u32, s.y as u32);
-        let (x1, y1) = (e.x as u32, e.y as u32);
-        let (xmin, xmax) = (x0.min(x1), x0.max(x1));
-        let (ymin, ymax) = (y0.min(y1), y0.max(y1));
-        let w = img.width();
-        let h = img.height();
+        match tool {
+            Tool::Rectangle => {
+                let (x0, y0) = (s.x as u32, s.y as u32);
+                let (x1, y1) = (e.x as u32, e.y as u32);
+                let (xmin, xmax) = (x0.min(x1), x0.max(x1));
+                let (ymin, ymax) = (y0.min(y1), y0.max(y1));
+                let w = img.width();
+                let h = img.height();
 
-        // Top and bottom edges
-        for x in xmin..=xmax {
-            if x >= w { continue; }
-            for k in 0..t {
-                if ymin + k < h { img.put_pixel(x, ymin + k, px); }
-                if ymax >= k && ymax - k < h { img.put_pixel(x, ymax - k, px); }
+                for x in xmin..=xmax {
+                    if x >= w { continue; }
+                    for k in 0..t {
+                        if ymin + k < h { img.put_pixel(x, ymin + k, px); }
+                        if ymax >= k && ymax - k < h { img.put_pixel(x, ymax - k, px); }
+                    }
+                }
+                for y in ymin..=ymax {
+                    if y >= h { continue; }
+                    for k in 0..t {
+                        if xmin + k < w { img.put_pixel(xmin + k, y, px); }
+                        if xmax >= k && xmax - k < w { img.put_pixel(xmax - k, y, px); }
+                    }
+                }
             }
-        }
-        // Left and right edges
-        for y in ymin..=ymax {
-            if y >= h { continue; }
-            for k in 0..t {
-                if xmin + k < w { img.put_pixel(xmin + k, y, px); }
-                if xmax >= k && xmax - k < w { img.put_pixel(xmax - k, y, px); }
+            Tool::Circle => {
+                let cx = (s.x + e.x) / 2.0;
+                let cy = (s.y + e.y) / 2.0;
+                let rx = (e.x - s.x).abs() / 2.0;
+                let ry = (e.y - s.y).abs() / 2.0;
+                render_ellipse(&mut img, cx, cy, rx, ry, px, t);
             }
         }
     }
 
     img
+}
+
+fn render_ellipse(
+    img: &mut ImageBuffer<Rgba<u8>, Vec<u8>>,
+    cx: f32, cy: f32, rx: f32, ry: f32,
+    px: Rgba<u8>, thickness: u32,
+) {
+    let w = img.width() as i64;
+    let h = img.height() as i64;
+    // Enough steps to avoid gaps at the widest arc
+    let steps = ((rx.max(ry) * 2.0 * std::f32::consts::PI * 2.0) as usize).max(1440);
+    let half_t = (thickness as f32 - 1.0) / 2.0;
+
+    for i in 0..steps {
+        let angle = (i as f32 / steps as f32) * 2.0 * std::f32::consts::PI;
+        let cos_a = angle.cos();
+        let sin_a = angle.sin();
+        // Draw `thickness` concentric ellipses offset inward/outward
+        for k in 0..thickness {
+            let offset = k as f32 - half_t;
+            let ex = cx + (rx + offset) * cos_a;
+            let ey = cy + (ry + offset) * sin_a;
+            let xi = ex.round() as i64;
+            let yi = ey.round() as i64;
+            if xi >= 0 && xi < w && yi >= 0 && yi < h {
+                img.put_pixel(xi as u32, yi as u32, px);
+            }
+        }
+    }
 }
 
 fn copy_to_clipboard(img: &ImageBuffer<Rgba<u8>, Vec<u8>>) {
