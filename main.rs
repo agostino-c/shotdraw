@@ -1,7 +1,12 @@
-use eframe::egui::{self, Pos2, Rect, Stroke, Color32, CentralPanel};
+use eframe::egui::{self, Pos2, Rect, Stroke, Color32, CentralPanel, TopBottomPanel};
 use std::process::{Command, Stdio};
 use std::io::{Read, Write, Cursor};
 use image::{ImageBuffer, Rgba, DynamicImage, ImageFormat};
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Tool {
+    Rectangle,
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -23,6 +28,9 @@ fn main() {
         end_pos: None,
         drawing: false,
         done: false,
+        tool: Tool::Rectangle,
+        color: Color32::RED,
+        thickness: 2.0,
     };
 
     // Apply float+fullscreen as a one-shot criteria command (not for_window, which is persistent).
@@ -57,6 +65,9 @@ struct ScreenshotApp {
     end_pos: Option<Pos2>,
     drawing: bool,
     done: bool,
+    tool: Tool,
+    color: Color32,
+    thickness: f32,
 }
 
 impl eframe::App for ScreenshotApp {
@@ -72,6 +83,60 @@ impl eframe::App for ScreenshotApp {
             self.done = true;
         }
 
+        TopBottomPanel::top("toolbar").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                // Tool selector
+                ui.label("Tool:");
+                ui.selectable_value(&mut self.tool, Tool::Rectangle, "⬜ Rect");
+
+                ui.separator();
+
+                // Color swatches
+                ui.label("Color:");
+                let swatches = [
+                    ("R", Color32::RED),
+                    ("O", Color32::from_rgb(255, 128, 0)),
+                    ("Y", Color32::YELLOW),
+                    ("G", Color32::GREEN),
+                    ("B", Color32::from_rgb(0, 112, 255)),
+                    ("M", Color32::from_rgb(255, 0, 255)),
+                    ("W", Color32::WHITE),
+                    ("K", Color32::BLACK),
+                ];
+                for (label, swatch_color) in swatches {
+                    let selected = self.color == swatch_color;
+                    let size = egui::vec2(20.0, 20.0);
+                    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+                    if response.clicked() {
+                        self.color = swatch_color;
+                    }
+                    let painter = ui.painter();
+                    painter.rect_filled(rect, egui::CornerRadius::same(3), swatch_color);
+                    if selected {
+                        painter.rect_stroke(
+                            rect,
+                            egui::CornerRadius::same(3),
+                            Stroke::new(2.0, Color32::from_white_alpha(220)),
+                            egui::StrokeKind::Outside,
+                        );
+                    }
+                    // Invisible label for accessibility / tooltip
+                    let _ = label;
+                }
+
+                ui.separator();
+
+                // Stroke thickness
+                ui.label("Size:");
+                ui.add(
+                    egui::DragValue::new(&mut self.thickness)
+                        .range(1.0..=10.0)
+                        .speed(0.1)
+                        .suffix("px"),
+                );
+            });
+        });
+
         CentralPanel::default().show(ctx, |ui| {
             // Draw screenshot as background
             let texture_id = ui.ctx().load_texture(
@@ -84,14 +149,16 @@ impl eframe::App for ScreenshotApp {
             );
             ui.image(&texture_id);
 
-            // Mouse drawing
+            // Mouse drawing — only track clicks that land in the central panel, not the toolbar
             if ctx.input(|i| i.pointer.primary_down()) {
                 if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
-                    if !self.drawing {
-                        self.start_pos = Some(pos);
-                        self.drawing = true;
+                    if ui.rect_contains_pointer(ui.min_rect()) || self.drawing {
+                        if !self.drawing {
+                            self.start_pos = Some(pos);
+                            self.drawing = true;
+                        }
+                        self.end_pos = Some(pos);
                     }
-                    self.end_pos = Some(pos);
                 }
             } else if self.drawing {
                 self.drawing = false;
@@ -102,7 +169,7 @@ impl eframe::App for ScreenshotApp {
                 ui.painter().rect_stroke(
                     Rect::from_two_pos(start, end),
                     egui::CornerRadius::ZERO,
-                    Stroke::new(2.0, Color32::RED),
+                    Stroke::new(self.thickness, self.color),
                     egui::StrokeKind::Middle,
                 );
             }
@@ -110,7 +177,13 @@ impl eframe::App for ScreenshotApp {
 
         // If finished, render and copy + exit
         if self.done {
-            let annotated = render_to_image(&self.screenshot, self.start_pos, self.end_pos);
+            let annotated = render_to_image(
+                &self.screenshot,
+                self.start_pos,
+                self.end_pos,
+                self.color,
+                self.thickness,
+            );
             copy_to_clipboard(&annotated);
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -147,23 +220,36 @@ fn render_to_image(
     base: &ImageBuffer<Rgba<u8>, Vec<u8>>,
     start: Option<Pos2>,
     end: Option<Pos2>,
+    color: Color32,
+    thickness: f32,
 ) -> ImageBuffer<Rgba<u8>, Vec<u8>> {
     let mut img = base.clone();
+    let px = Rgba([color.r(), color.g(), color.b(), color.a()]);
+    let t = (thickness.round() as u32).max(1);
 
     if let (Some(s), Some(e)) = (start, end) {
         let (x0, y0) = (s.x as u32, s.y as u32);
         let (x1, y1) = (e.x as u32, e.y as u32);
         let (xmin, xmax) = (x0.min(x1), x0.max(x1));
         let (ymin, ymax) = (y0.min(y1), y0.max(y1));
+        let w = img.width();
+        let h = img.height();
 
-        // Added basic bounds checking to prevent panics if drawing slightly off-screen
+        // Top and bottom edges
         for x in xmin..=xmax {
-            if x < img.width() && ymin < img.height() { img.put_pixel(x, ymin, Rgba([255, 0, 0, 255])); }
-            if x < img.width() && ymax < img.height() { img.put_pixel(x, ymax, Rgba([255, 0, 0, 255])); }
+            if x >= w { continue; }
+            for k in 0..t {
+                if ymin + k < h { img.put_pixel(x, ymin + k, px); }
+                if ymax >= k && ymax - k < h { img.put_pixel(x, ymax - k, px); }
+            }
         }
+        // Left and right edges
         for y in ymin..=ymax {
-            if xmin < img.width() && y < img.height() { img.put_pixel(xmin, y, Rgba([255, 0, 0, 255])); }
-            if xmax < img.width() && y < img.height() { img.put_pixel(xmax, y, Rgba([255, 0, 0, 255])); }
+            if y >= h { continue; }
+            for k in 0..t {
+                if xmin + k < w { img.put_pixel(xmin + k, y, px); }
+                if xmax >= k && xmax - k < w { img.put_pixel(xmax - k, y, px); }
+            }
         }
     }
 
