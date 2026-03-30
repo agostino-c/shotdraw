@@ -7,6 +7,16 @@ use image::{ImageBuffer, Rgba, DynamicImage, ImageFormat};
 enum Tool {
     Rectangle,
     Circle,
+    Arrow,
+}
+
+#[derive(Clone)]
+struct DrawnShape {
+    tool: Tool,
+    start: Pos2,
+    end: Pos2,
+    color: Color32,
+    thickness: f32,
 }
 
 fn main() {
@@ -25,8 +35,9 @@ fn main() {
 
     let app = ScreenshotApp {
         screenshot: rgba,
-        start_pos: None,
-        end_pos: None,
+        shapes: Vec::new(),
+        drag_start: None,
+        drag_end: None,
         drawing: false,
         done: false,
         tool: Tool::Rectangle,
@@ -34,8 +45,6 @@ fn main() {
         thickness: 2.0,
     };
 
-    // Apply float+fullscreen as a one-shot criteria command (not for_window, which is persistent).
-    // Run in a background thread so it fires after the window appears.
     std::thread::spawn(|| {
         std::thread::sleep(std::time::Duration::from_millis(150));
         Command::new("swaymsg")
@@ -56,14 +65,14 @@ fn main() {
     )
     .unwrap();
 
-    // Ensure the workspace fullscreen state is cleared after the window closes.
     Command::new("swaymsg").arg("fullscreen disable").output().ok();
 }
 
 struct ScreenshotApp {
     screenshot: ImageBuffer<Rgba<u8>, Vec<u8>>,
-    start_pos: Option<Pos2>,
-    end_pos: Option<Pos2>,
+    shapes: Vec<DrawnShape>,
+    drag_start: Option<Pos2>,
+    drag_end: Option<Pos2>,
     drawing: bool,
     done: bool,
     tool: Tool,
@@ -73,27 +82,29 @@ struct ScreenshotApp {
 
 impl eframe::App for ScreenshotApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Press Escape to cancel without copying
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
 
-        // Press Enter to finish drawing
         if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
             self.done = true;
         }
 
+        // Ctrl+Z: undo last committed shape
+        if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Z)) {
+            self.shapes.pop();
+        }
+
         TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                // Tool selector
                 ui.label("Tool:");
                 ui.selectable_value(&mut self.tool, Tool::Rectangle, "⬜ Rect");
                 ui.selectable_value(&mut self.tool, Tool::Circle, "⭕ Circle");
+                ui.selectable_value(&mut self.tool, Tool::Arrow, "➡ Arrow");
 
                 ui.separator();
 
-                // Color swatches
                 ui.label("Color:");
                 let swatches = [
                     ("R", Color32::RED),
@@ -122,13 +133,11 @@ impl eframe::App for ScreenshotApp {
                             egui::StrokeKind::Outside,
                         );
                     }
-                    // Invisible label for accessibility / tooltip
                     let _ = label;
                 }
 
                 ui.separator();
 
-                // Stroke thickness
                 ui.label("Size:");
                 ui.add(
                     egui::DragValue::new(&mut self.thickness)
@@ -136,11 +145,13 @@ impl eframe::App for ScreenshotApp {
                         .speed(0.1)
                         .suffix("px"),
                 );
+
+                ui.separator();
+                ui.label(format!("Shapes: {}  (Ctrl+Z undo)", self.shapes.len()));
             });
         });
 
         CentralPanel::default().show(ctx, |ui| {
-            // Draw screenshot as background
             let texture_id = ui.ctx().load_texture(
                 "screenshot",
                 egui::ColorImage::from_rgba_unmultiplied(
@@ -151,64 +162,93 @@ impl eframe::App for ScreenshotApp {
             );
             ui.image(&texture_id);
 
-            // Mouse drawing — only track clicks that land in the central panel, not the toolbar
-            if ctx.input(|i| i.pointer.primary_down()) {
-                if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
+            let primary_down = ctx.input(|i| i.pointer.primary_down());
+            let interact_pos = ctx.input(|i| i.pointer.interact_pos());
+
+            if primary_down {
+                if let Some(pos) = interact_pos {
                     if ui.rect_contains_pointer(ui.min_rect()) || self.drawing {
                         if !self.drawing {
-                            self.start_pos = Some(pos);
+                            self.drag_start = Some(pos);
                             self.drawing = true;
                         }
-                        self.end_pos = Some(pos);
+                        self.drag_end = Some(pos);
                     }
                 }
             } else if self.drawing {
+                // Mouse released — commit the shape if we have a valid drag
+                if let (Some(start), Some(end)) = (self.drag_start, self.drag_end) {
+                    self.shapes.push(DrawnShape {
+                        tool: self.tool,
+                        start,
+                        end,
+                        color: self.color,
+                        thickness: self.thickness,
+                    });
+                }
+                self.drag_start = None;
+                self.drag_end = None;
                 self.drawing = false;
             }
 
-            if let (Some(start), Some(end)) = (self.start_pos, self.end_pos) {
-                let stroke = Stroke::new(self.thickness, self.color);
-                match self.tool {
-                    Tool::Rectangle => {
-                        ui.painter().rect_stroke(
-                            Rect::from_two_pos(start, end),
-                            egui::CornerRadius::ZERO,
-                            stroke,
-                            egui::StrokeKind::Middle,
-                        );
-                    }
-                    Tool::Circle => {
-                        let center = egui::pos2(
-                            (start.x + end.x) / 2.0,
-                            (start.y + end.y) / 2.0,
-                        );
-                        let radii = egui::vec2(
-                            (end.x - start.x).abs() / 2.0,
-                            (end.y - start.y).abs() / 2.0,
-                        );
-                        ui.painter().add(egui::Shape::Ellipse(egui::epaint::EllipseShape {
-                            center,
-                            radius: radii,
-                            fill: Color32::TRANSPARENT,
-                            stroke,
-                        }));
-                    }
-                }
+            let painter = ui.painter();
+
+            // Render all committed shapes
+            for shape in &self.shapes {
+                paint_shape(painter, shape);
+            }
+
+            // Live preview of in-progress drag
+            if let (Some(start), Some(end)) = (self.drag_start, self.drag_end) {
+                let preview = DrawnShape {
+                    tool: self.tool,
+                    start,
+                    end,
+                    color: self.color,
+                    thickness: self.thickness,
+                };
+                paint_shape(painter, &preview);
             }
         });
 
-        // If finished, render and copy + exit
         if self.done {
-            let annotated = render_to_image(
-                &self.screenshot,
-                self.start_pos,
-                self.end_pos,
-                self.tool,
-                self.color,
-                self.thickness,
-            );
+            let annotated = render_to_image(&self.screenshot, &self.shapes);
             copy_to_clipboard(&annotated);
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+}
+
+fn paint_shape(painter: &egui::Painter, shape: &DrawnShape) {
+    let stroke = Stroke::new(shape.thickness, shape.color);
+    match shape.tool {
+        Tool::Rectangle => {
+            painter.rect_stroke(
+                Rect::from_two_pos(shape.start, shape.end),
+                egui::CornerRadius::ZERO,
+                stroke,
+                egui::StrokeKind::Middle,
+            );
+        }
+        Tool::Circle => {
+            let center = egui::pos2(
+                (shape.start.x + shape.end.x) / 2.0,
+                (shape.start.y + shape.end.y) / 2.0,
+            );
+            let radii = egui::vec2(
+                (shape.end.x - shape.start.x).abs() / 2.0,
+                (shape.end.y - shape.start.y).abs() / 2.0,
+            );
+            painter.add(egui::Shape::Ellipse(egui::epaint::EllipseShape {
+                center,
+                radius: radii,
+                fill: Color32::TRANSPARENT,
+                stroke,
+            }));
+        }
+        Tool::Arrow => {
+            let vec = shape.end - shape.start;
+            painter.arrow(shape.start, vec, stroke);
         }
     }
 }
@@ -241,21 +281,18 @@ fn run_grim(geometry: &str) -> Vec<u8> {
 
 fn render_to_image(
     base: &ImageBuffer<Rgba<u8>, Vec<u8>>,
-    start: Option<Pos2>,
-    end: Option<Pos2>,
-    tool: Tool,
-    color: Color32,
-    thickness: f32,
+    shapes: &[DrawnShape],
 ) -> ImageBuffer<Rgba<u8>, Vec<u8>> {
     let mut img = base.clone();
-    let px = Rgba([color.r(), color.g(), color.b(), color.a()]);
-    let t = (thickness.round() as u32).max(1);
 
-    if let (Some(s), Some(e)) = (start, end) {
-        match tool {
+    for shape in shapes {
+        let px = Rgba([shape.color.r(), shape.color.g(), shape.color.b(), shape.color.a()]);
+        let t = (shape.thickness.round() as u32).max(1);
+
+        match shape.tool {
             Tool::Rectangle => {
-                let (x0, y0) = (s.x as u32, s.y as u32);
-                let (x1, y1) = (e.x as u32, e.y as u32);
+                let (x0, y0) = (shape.start.x as u32, shape.start.y as u32);
+                let (x1, y1) = (shape.end.x as u32, shape.end.y as u32);
                 let (xmin, xmax) = (x0.min(x1), x0.max(x1));
                 let (ymin, ymax) = (y0.min(y1), y0.max(y1));
                 let w = img.width();
@@ -277,16 +314,154 @@ fn render_to_image(
                 }
             }
             Tool::Circle => {
-                let cx = (s.x + e.x) / 2.0;
-                let cy = (s.y + e.y) / 2.0;
-                let rx = (e.x - s.x).abs() / 2.0;
-                let ry = (e.y - s.y).abs() / 2.0;
+                let cx = (shape.start.x + shape.end.x) / 2.0;
+                let cy = (shape.start.y + shape.end.y) / 2.0;
+                let rx = (shape.end.x - shape.start.x).abs() / 2.0;
+                let ry = (shape.end.y - shape.start.y).abs() / 2.0;
                 render_ellipse(&mut img, cx, cy, rx, ry, px, t);
+            }
+            Tool::Arrow => {
+                render_arrow(&mut img, shape.start, shape.end, px, t);
             }
         }
     }
 
     img
+}
+
+fn render_arrow(
+    img: &mut ImageBuffer<Rgba<u8>, Vec<u8>>,
+    start: Pos2,
+    end: Pos2,
+    px: Rgba<u8>,
+    thickness: u32,
+) {
+    let dx = end.x - start.x;
+    let dy = end.y - start.y;
+    let len = (dx * dx + dy * dy).sqrt();
+    if len < 1.0 {
+        return;
+    }
+
+    let dir_x = dx / len;
+    let dir_y = dy / len;
+    let perp_x = -dir_y;
+    let perp_y = dir_x;
+
+    let head_len = 20.0 + thickness as f32 * 3.0;
+    let head_width = 8.0 + thickness as f32 * 2.5;
+
+    // Shaft ends before the arrowhead base so the line doesn't overdraw the triangle
+    let shaft_end_x = end.x - dir_x * head_len;
+    let shaft_end_y = end.y - dir_y * head_len;
+
+    draw_line(
+        img,
+        start.x as i64, start.y as i64,
+        shaft_end_x as i64, shaft_end_y as i64,
+        px, thickness,
+    );
+
+    // Arrowhead triangle vertices
+    let tip = (end.x, end.y);
+    let base_center = (end.x - dir_x * head_len, end.y - dir_y * head_len);
+    let left  = (base_center.0 + perp_x * head_width, base_center.1 + perp_y * head_width);
+    let right = (base_center.0 - perp_x * head_width, base_center.1 - perp_y * head_width);
+
+    fill_triangle(img, tip, left, right, px);
+}
+
+// Bresenham line with a t×t square brush at each plotted point
+fn draw_line(
+    img: &mut ImageBuffer<Rgba<u8>, Vec<u8>>,
+    x0: i64, y0: i64,
+    x1: i64, y1: i64,
+    px: Rgba<u8>,
+    t: u32,
+) {
+    let w = img.width() as i64;
+    let h = img.height() as i64;
+    let half = (t as i64) / 2;
+
+    let dx = (x1 - x0).abs();
+    let dy = -(y1 - y0).abs();
+    let sx: i64 = if x0 < x1 { 1 } else { -1 };
+    let sy: i64 = if y0 < y1 { 1 } else { -1 };
+    let mut err = dx + dy;
+
+    let mut cx = x0;
+    let mut cy = y0;
+
+    loop {
+        // Paint t×t square brush
+        for ky in 0..t as i64 {
+            for kx in 0..t as i64 {
+                let px_x = cx - half + kx;
+                let px_y = cy - half + ky;
+                if px_x >= 0 && px_x < w && px_y >= 0 && px_y < h {
+                    img.put_pixel(px_x as u32, px_y as u32, px);
+                }
+            }
+        }
+
+        if cx == x1 && cy == y1 { break; }
+
+        let e2 = 2 * err;
+        if e2 >= dy {
+            if cx == x1 { break; }
+            err += dy;
+            cx += sx;
+        }
+        if e2 <= dx {
+            if cy == y1 { break; }
+            err += dx;
+            cy += sy;
+        }
+    }
+}
+
+// Scanline fill for a triangle defined by three float-coordinate vertices
+fn fill_triangle(
+    img: &mut ImageBuffer<Rgba<u8>, Vec<u8>>,
+    v0: (f32, f32),
+    v1: (f32, f32),
+    v2: (f32, f32),
+    px: Rgba<u8>,
+) {
+    let w = img.width() as i64;
+    let h = img.height() as i64;
+
+    let y_min = v0.1.min(v1.1).min(v2.1).floor() as i64;
+    let y_max = v0.1.max(v1.1).max(v2.1).ceil()  as i64;
+
+    let edges = [(v0, v1), (v1, v2), (v2, v0)];
+
+    for y in y_min..=y_max {
+        if y < 0 || y >= h { continue; }
+        let yf = y as f32 + 0.5;
+
+        let mut x_intersections: Vec<f32> = Vec::new();
+        for &(a, b) in &edges {
+            let (ay, by) = (a.1, b.1);
+            // Does this scanline cross the edge?
+            if (ay <= yf && by > yf) || (by <= yf && ay > yf) {
+                let t = (yf - ay) / (by - ay);
+                x_intersections.push(a.0 + t * (b.0 - a.0));
+            }
+        }
+
+        if x_intersections.len() < 2 { continue; }
+        x_intersections.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+        let x0 = x_intersections[0].floor() as i64;
+        let x1 = x_intersections[x_intersections.len() - 1].ceil() as i64;
+
+        for x in x0..=x1 {
+            if x >= 0 && x < w {
+                img.put_pixel(x as u32, y as u32, px);
+            }
+        }
+    }
 }
 
 fn render_ellipse(
@@ -296,7 +471,6 @@ fn render_ellipse(
 ) {
     let w = img.width() as i64;
     let h = img.height() as i64;
-    // Enough steps to avoid gaps at the widest arc
     let steps = ((rx.max(ry) * 2.0 * std::f32::consts::PI * 2.0) as usize).max(1440);
     let half_t = (thickness as f32 - 1.0) / 2.0;
 
@@ -304,7 +478,6 @@ fn render_ellipse(
         let angle = (i as f32 / steps as f32) * 2.0 * std::f32::consts::PI;
         let cos_a = angle.cos();
         let sin_a = angle.sin();
-        // Draw `thickness` concentric ellipses offset inward/outward
         for k in 0..thickness {
             let offset = k as f32 - half_t;
             let ex = cx + (rx + offset) * cos_a;
