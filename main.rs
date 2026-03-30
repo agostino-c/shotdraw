@@ -25,10 +25,15 @@ fn main() {
         done: false,
     };
 
-    Command::new("swaymsg")
-        .arg("for_window [title=\"Screenshot Annotator\"] floating enable, fullscreen enable")
-        .output()
-        .expect("Failed to run swaymsg");
+    // Apply float+fullscreen as a one-shot criteria command (not for_window, which is persistent).
+    // Run in a background thread so it fires after the window appears.
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        Command::new("swaymsg")
+            .arg(r#"[title="Screenshot Annotator"] floating enable, fullscreen enable"#)
+            .output()
+            .ok();
+    });
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([width, height]),
@@ -41,6 +46,9 @@ fn main() {
         Box::new(|_cc| Ok(Box::new(app))),
     )
     .unwrap();
+
+    // Ensure the workspace fullscreen state is cleared after the window closes.
+    Command::new("swaymsg").arg("fullscreen disable").output().ok();
 }
 
 struct ScreenshotApp {
