@@ -123,6 +123,7 @@ fn main() {
                 text_anchor: None,
                 text_buffer: String::new(),
                 font_size: 24.0,
+                panel_min: Pos2::ZERO,
             }))
         }),
     )
@@ -146,6 +147,7 @@ struct ScreenshotApp {
     text_anchor: Option<Pos2>,
     text_buffer: String,
     font_size: f32,
+    panel_min: Pos2,
 }
 
 impl ScreenshotApp {
@@ -263,6 +265,7 @@ impl eframe::App for ScreenshotApp {
         });
 
         CentralPanel::default().show(ctx, |ui| {
+            self.panel_min = ui.min_rect().min;
             ui.image(&self.texture);
 
             let (primary_down, interact_pos) = ctx.input(|i| (i.pointer.primary_down(), i.pointer.interact_pos()));
@@ -360,7 +363,7 @@ impl eframe::App for ScreenshotApp {
 
         if self.done {
             self.done = false;
-            let annotated = render_to_image(&self.screenshot, &self.shapes, &self.font_bytes);
+            let annotated = render_to_image(&self.screenshot, &self.shapes, &self.font_bytes, self.panel_min);
             copy_to_clipboard(&annotated);
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -492,17 +495,22 @@ fn render_to_image(
     base: &ImageBuffer<Rgba<u8>, Vec<u8>>,
     shapes: &[DrawnShape],
     font_bytes: &[u8],
+    panel_min: Pos2,
 ) -> ImageBuffer<Rgba<u8>, Vec<u8>> {
     let mut img = base.clone();
 
     for shape in shapes {
+        let offset = panel_min.to_vec2();
+        let start = shape.start - offset;
+        let end = shape.end - offset;
+
         let px = Rgba([shape.color.r(), shape.color.g(), shape.color.b(), shape.color.a()]);
         let t = (shape.thickness.round() as u32).max(1);
 
         match shape.tool {
             Tool::Rectangle => {
-                let (x0, y0) = (shape.start.x as i64, shape.start.y as i64);
-                let (x1, y1) = (shape.end.x as i64, shape.end.y as i64);
+                let (x0, y0) = (start.x as i64, start.y as i64);
+                let (x1, y1) = (end.x as i64, end.y as i64);
                 let (xmin, xmax) = (x0.min(x1), x0.max(x1));
                 let (ymin, ymax) = (y0.min(y1), y0.max(y1));
                 let w = img.width() as i64;
@@ -528,20 +536,20 @@ fn render_to_image(
                 }
             }
             Tool::Circle => {
-                let cx = (shape.start.x + shape.end.x) / 2.0;
-                let cy = (shape.start.y + shape.end.y) / 2.0;
-                let rx = (shape.end.x - shape.start.x).abs() / 2.0;
-                let ry = (shape.end.y - shape.start.y).abs() / 2.0;
+                let cx = (start.x + end.x) / 2.0;
+                let cy = (start.y + end.y) / 2.0;
+                let rx = (end.x - start.x).abs() / 2.0;
+                let ry = (end.y - start.y).abs() / 2.0;
                 render_ellipse(&mut img, cx, cy, rx, ry, px, t);
             }
             Tool::Arrow => {
-                render_arrow(&mut img, shape.start, shape.end, px, t);
+                render_arrow(&mut img, start, end, px, t);
             }
             Tool::Text => {
                 if !shape.text.is_empty() {
                     let font = ab_glyph::FontVec::try_from_vec(font_bytes.to_vec())
                         .expect("Invalid font data");
-                    render_text(&mut img, &shape.text, shape.start.x, shape.start.y,
+                    render_text(&mut img, &shape.text, start.x, start.y,
                                 shape.font_size, px, &font);
                 }
             }
